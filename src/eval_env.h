@@ -22,7 +22,34 @@ using namespace std;
 
 #include "string_piece.h"
 
-struct EvalString;
+struct Rule;
+
+/// An interface for a scope for variable (e.g. "$foo") lookups.
+struct Env {
+  virtual ~Env() {}
+  virtual string LookupVariable(const string& var) = 0;
+};
+
+/// A tokenized string that contains variable references.
+/// Can be evaluated relative to an Env.
+struct EvalString {
+  string Evaluate(Env* env) const;
+
+  void Clear() { parsed_.clear(); }
+  bool empty() const { return parsed_.empty(); }
+
+  void AddText(StringPiece text);
+  void AddSpecial(StringPiece text);
+
+  /// Construct a human-readable representation of the parsed state,
+  /// for use in tests.
+  string Serialize() const;
+
+private:
+  enum TokenType { RAW, SPECIAL };
+  typedef vector<pair<string, TokenType> > TokenList;
+  TokenList parsed_;
+};
 
 /// An invokable build command and associated metadata (description, etc.).
 struct Rule {
@@ -45,18 +72,11 @@ struct Rule {
   map<string, EvalString> bindings_;
 };
 
-/// An interface for a scope for variable (e.g. "$foo") lookups.
-struct Env {
-  virtual ~Env() {}
-  virtual string LookupVariable(const string& var) = 0;
-  virtual const Rule* LookupRule(const string& rule_name) = 0;
-};
-
 /// An Env which contains a mapping of variables to values
 /// as well as a pointer to a parent scope.
 struct BindingEnv : public Env {
   BindingEnv() : parent_(NULL) {}
-  explicit BindingEnv(Env* parent) : parent_(parent) {}
+  explicit BindingEnv(BindingEnv* parent) : parent_(parent) {}
 
   virtual ~BindingEnv() {}
   virtual string LookupVariable(const string& var);
@@ -64,7 +84,7 @@ struct BindingEnv : public Env {
   void AddRule(const Rule* rule);
   const Rule* LookupRule(const string& rule_name);
   const Rule* LookupRuleCurrentScope(const string& rule_name);
-  const map<string, const Rule*> GetRules() const;
+  const map<string, const Rule*>& GetRules() const;
 
   void AddBinding(const string& key, const string& val);
 
@@ -79,28 +99,7 @@ struct BindingEnv : public Env {
 private:
   map<string, string> bindings_;
   map<string, const Rule*> rules_;
-  Env* parent_;
-};
-
-/// A tokenized string that contains variable references.
-/// Can be evaluated relative to an Env.
-struct EvalString {
-  string Evaluate(Env* env) const;
-
-  void Clear() { parsed_.clear(); }
-  bool empty() const { return parsed_.empty(); }
-
-  void AddText(StringPiece text);
-  void AddSpecial(StringPiece text);
-
-  /// Construct a human-readable representation of the parsed state,
-  /// for use in tests.
-  string Serialize() const;
-
-private:
-  enum TokenType { RAW, SPECIAL };
-  typedef vector<pair<string, TokenType> > TokenList;
-  TokenList parsed_;
+  BindingEnv* parent_;
 };
 
 #endif  // NINJA_EVAL_ENV_H_

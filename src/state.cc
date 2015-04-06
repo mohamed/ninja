@@ -61,6 +61,7 @@ void Pool::Dump() const {
   }
 }
 
+// static
 bool Pool::WeightedEdgeCmp(const Edge* a, const Edge* b) {
   if (!a) return b;
   if (!b) return false;
@@ -139,16 +140,13 @@ void State::AddIn(Edge* edge, StringPiece path, unsigned int slash_bits) {
   node->AddOutEdge(edge);
 }
 
-void State::AddOut(Edge* edge, StringPiece path, unsigned int slash_bits) {
+bool State::AddOut(Edge* edge, StringPiece path, unsigned int slash_bits) {
   Node* node = GetNode(path, slash_bits);
+  if (node->in_edge())
+    return false;
   edge->outputs_.push_back(node);
-  if (node->in_edge()) {
-    Warning("multiple rules generate %s. "
-            "builds involving this target will not be correct; "
-            "continuing anyway",
-            path.AsString().c_str());
-  }
   node->set_in_edge(edge);
+  return true;
 }
 
 bool State::AddDefault(StringPiece path, string* err) {

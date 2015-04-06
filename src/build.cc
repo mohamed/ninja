@@ -278,7 +278,7 @@ bool Plan::AddSubTarget(Node* node, vector<Node*>* stack, string* err) {
     return false;
   }
 
-  if (CheckDependencyCycle(node, stack, err))
+  if (CheckDependencyCycle(node, *stack, err))
     return false;
 
   if (edge->outputs_ready())
@@ -316,20 +316,32 @@ bool Plan::AddSubTarget(Node* node, vector<Node*>* stack, string* err) {
   return true;
 }
 
-bool Plan::CheckDependencyCycle(Node* node, vector<Node*>* stack, string* err) {
-  vector<Node*>::reverse_iterator ri =
-      find(stack->rbegin(), stack->rend(), node);
-  if (ri == stack->rend())
+bool Plan::CheckDependencyCycle(Node* node, const vector<Node*>& stack,
+                                string* err) {
+  vector<Node*>::const_iterator start = stack.begin();
+  while (start != stack.end() && (*start)->in_edge() != node->in_edge())
+    ++start;
+  if (start == stack.end())
     return false;
 
-  // Add this node onto the stack to make it clearer where the loop
-  // is.
-  stack->push_back(node);
+  // Build error string for the cycle.
+  vector<Node*> cycle(start, stack.end());
+  cycle.push_back(node);
 
-  vector<Node*>::iterator start = find(stack->begin(), stack->end(), node);
+  if (cycle.front() != cycle.back()) {
+    // Consider
+    //   build a b: cat c
+    //   build c: cat a
+    // stack will contain [b, c], node will be a.  To not print b -> c -> a,
+    // shift by one to get c -> a -> c which makes the cycle clear.
+    cycle.erase(cycle.begin());
+    cycle.push_back(cycle.front());
+    assert(cycle.front() == cycle.back());
+  }
+
   *err = "dependency cycle: ";
-  for (vector<Node*>::iterator i = start; i != stack->end(); ++i) {
-    if (i != start)
+  for (vector<Node*>::const_iterator i = cycle.begin(); i != cycle.end(); ++i) {
+    if (i != cycle.begin())
       err->append(" -> ");
     err->append((*i)->path());
   }
@@ -406,7 +418,7 @@ void Plan::NodeFinished(Node* node) {
   }
 }
 
-void Plan::CleanNode(DependencyScan* scan, Node* node) {
+bool Plan::CleanNode(DependencyScan* scan, Node* node, string* err) {
   node->set_dirty(false);
 
   for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
@@ -436,10 +448,16 @@ void Plan::CleanNode(DependencyScan* scan, Node* node) {
       // Now, this edge is dirty if any of the outputs are dirty.
       // If the edge isn't dirty, clean the outputs and mark the edge as not
       // wanted.
-      if (!scan->RecomputeOutputsDirty(*oe, most_recent_input)) {
+      bool outputs_dirty = false;
+      if (!scan->RecomputeOutputsDirty(*oe, most_recent_input,
+                                       &outputs_dirty, err)) {
+        return false;
+      }
+      if (!outputs_dirty) {
         for (vector<Node*>::iterator o = (*oe)->outputs_.begin();
              o != (*oe)->outputs_.end(); ++o) {
-          CleanNode(scan, *o);
+          if (!CleanNode(scan, *o, err))
+            return false;
         }
 
         want_e->second = false;
@@ -449,6 +467,7 @@ void Plan::CleanNode(DependencyScan* scan, Node* node) {
       }
     }
   }
+  return true;
 }
 
 void Plan::Dump() {
@@ -553,10 +572,12 @@ void Builder::Cleanup() {
         // need to rebuild an output because of a modified header file
         // mentioned in a depfile, and the command touches its depfile
         // but is interrupted before it touches its output file.)
-        if (!depfile.empty() ||
-            (*o)->mtime() != disk_interface_->Stat((*o)->path())) {
+        string err;
+        TimeStamp new_mtime = disk_interface_->Stat((*o)->path(), &err);
+        if (new_mtime == -1)  // Log and ignore Stat() errors.
+          Error("%s", err.c_str());
+        if (!depfile.empty() || (*o)->mtime() != new_mtime)
           disk_interface_->RemoveFile((*o)->path());
-        }
       }
       if (!depfile.empty())
         disk_interface_->RemoveFile(depfile);
@@ -753,12 +774,15 @@ bool Builder::FinishCommand(CommandRunner::Result* result, string* err) {
 
     for (vector<Node*>::iterator o = edge->outputs_.begin();
          o != edge->outputs_.end(); ++o) {
-      TimeStamp new_mtime = disk_interface_->Stat((*o)->path());
+      TimeStamp new_mtime = disk_interface_->Stat((*o)->path(), err);
+      if (new_mtime == -1)
+        return false;
       if ((*o)->mtime() == new_mtime) {
         // The rule command did not change the output.  Propagate the clean
         // state through the build graph.
         // Note that this also applies to nonexistent outputs (mtime == 0).
-        plan_.CleanNode(&scan_, *o);
+        if (!plan_.CleanNode(&scan_, *o, err))
+          return false;
         node_cleaned = true;
       }
     }
@@ -768,14 +792,18 @@ bool Builder::FinishCommand(CommandRunner::Result* result, string* err) {
       // (existing) non-order-only input or the depfile.
       for (vector<Node*>::iterator i = edge->inputs_.begin();
            i != edge->inputs_.end() - edge->order_only_deps_; ++i) {
-        TimeStamp input_mtime = disk_interface_->Stat((*i)->path());
+        TimeStamp input_mtime = disk_interface_->Stat((*i)->path(), err);
+        if (input_mtime == -1)
+          return false;
         if (input_mtime > restat_mtime)
           restat_mtime = input_mtime;
       }
 
       string depfile = edge->GetUnescapedDepfile();
       if (restat_mtime != 0 && deps_type.empty() && !depfile.empty()) {
-        TimeStamp depfile_mtime = disk_interface_->Stat(depfile);
+        TimeStamp depfile_mtime = disk_interface_->Stat(depfile, err);
+        if (depfile_mtime == -1)
+          return false;
         if (depfile_mtime > restat_mtime)
           restat_mtime = depfile_mtime;
       }
@@ -804,7 +832,9 @@ bool Builder::FinishCommand(CommandRunner::Result* result, string* err) {
   if (!deps_type.empty() && !config_.dry_run) {
     assert(edge->outputs_.size() == 1 && "should have been rejected by parser");
     Node* out = edge->outputs_[0];
-    TimeStamp deps_mtime = disk_interface_->Stat(out->path());
+    TimeStamp deps_mtime = disk_interface_->Stat(out->path(), err);
+    if (deps_mtime == -1)
+      return false;
     if (!scan_.deps_log()->RecordDeps(out, deps_mtime, deps_nodes)) {
       *err = string("Error writing to deps log: ") + strerror(errno);
       return false;

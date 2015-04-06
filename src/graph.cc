@@ -27,10 +27,9 @@
 #include "state.h"
 #include "util.h"
 
-bool Node::Stat(DiskInterface* disk_interface) {
+bool Node::Stat(DiskInterface* disk_interface, string* err) {
   METRIC_RECORD("node stat");
-  mtime_ = disk_interface->Stat(path_);
-  return mtime_ > 0;
+  return (mtime_ = disk_interface->Stat(path_, err)) != -1;
 }
 
 bool DependencyScan::RecomputeDirty(Edge* edge, string* err) {
@@ -48,7 +47,8 @@ bool DependencyScan::RecomputeDirty(Edge* edge, string* err) {
   // graphs.
   for (vector<Node*>::iterator o = edge->outputs_.begin();
        o != edge->outputs_.end(); ++o) {
-    (*o)->StatIfNecessary(disk_interface_);
+    if (!(*o)->StatIfNecessary(disk_interface_, err))
+      return false;
   }
 
   if (!dep_loader_.LoadDeps(edge, err)) {
@@ -62,7 +62,9 @@ bool DependencyScan::RecomputeDirty(Edge* edge, string* err) {
   Node* most_recent_input = NULL;
   for (vector<Node*>::iterator i = edge->inputs_.begin();
        i != edge->inputs_.end(); ++i) {
-    if ((*i)->StatIfNecessary(disk_interface_)) {
+    if (!(*i)->status_known()) {
+      if (!(*i)->StatIfNecessary(disk_interface_, err))
+        return false;
       if (Edge* in_edge = (*i)->in_edge()) {
         if (!RecomputeDirty(in_edge, err))
           return false;
@@ -97,7 +99,8 @@ bool DependencyScan::RecomputeDirty(Edge* edge, string* err) {
   // We may also be dirty due to output state: missing outputs, out of
   // date outputs, etc.  Visit all outputs and determine whether they're dirty.
   if (!dirty)
-    dirty = RecomputeOutputsDirty(edge, most_recent_input);
+    if (!RecomputeOutputsDirty(edge, most_recent_input, &dirty, err))
+      return false;
 
   // Finally, visit each output and update their dirty state if necessary.
   for (vector<Node*>::iterator o = edge->outputs_.begin();
@@ -117,16 +120,19 @@ bool DependencyScan::RecomputeDirty(Edge* edge, string* err) {
   return true;
 }
 
-bool DependencyScan::RecomputeOutputsDirty(Edge* edge,
-                                           Node* most_recent_input) {
+bool DependencyScan::RecomputeOutputsDirty(Edge* edge, Node* most_recent_input,
+                                           bool* outputs_dirty, string* err) {
   string command = edge->EvaluateCommand(/*incl_rsp_file=*/true);
   for (vector<Node*>::iterator o = edge->outputs_.begin();
        o != edge->outputs_.end(); ++o) {
-    (*o)->StatIfNecessary(disk_interface_);
-    if (RecomputeOutputDirty(edge, most_recent_input, command, *o))
+    if (!(*o)->StatIfNecessary(disk_interface_, err))
+      return false;
+    if (RecomputeOutputDirty(edge, most_recent_input, command, *o)) {
+      *outputs_dirty = true;
       return true;
+    }
   }
-  return false;
+  return true;
 }
 
 bool DependencyScan::RecomputeOutputDirty(Edge* edge,
@@ -205,9 +211,8 @@ struct EdgeEnv : public Env {
   enum EscapeKind { kShellEscape, kDoNotEscape };
 
   EdgeEnv(Edge* edge, EscapeKind escape)
-      : edge_(edge), escape_in_out_(escape) {}
+      : edge_(edge), escape_in_out_(escape), recursive_(false) {}
   virtual string LookupVariable(const string& var);
-  virtual const Rule* LookupRule(const string& rule_name);
 
   /// Given a span of Nodes, construct a list of paths suitable for a command
   /// line.
@@ -215,13 +220,12 @@ struct EdgeEnv : public Env {
                       vector<Node*>::iterator end,
                       char sep);
 
+ private:
+  vector<string> lookups_;
   Edge* edge_;
   EscapeKind escape_in_out_;
+  bool recursive_;
 };
-
-const Rule* EdgeEnv::LookupRule(const string& rule_name) {
-  return NULL;
-}
 
 string EdgeEnv::LookupVariable(const string& var) {
   if (var == "in" || var == "in_newline") {
@@ -236,8 +240,25 @@ string EdgeEnv::LookupVariable(const string& var) {
                         ' ');
   }
 
+  if (recursive_) {
+    vector<string>::const_iterator it;
+    if ((it = find(lookups_.begin(), lookups_.end(), var)) != lookups_.end()) {
+      string cycle;
+      for (; it != lookups_.end(); ++it)
+        cycle.append(*it + " -> ");
+      cycle.append(var);
+      Fatal(("cycle in rule variables: " + cycle).c_str());
+    }
+  }
+
   // See notes on BindingEnv::LookupWithFallback.
   const EvalString* eval = edge_->rule_->GetBinding(var);
+  if (recursive_ && eval)
+    lookups_.push_back(var);
+
+  // In practice, variables defined on rules never use another rule variable.
+  // For performance, only start checking for cycles after the first lookup.
+  recursive_ = true;
   return edge_->env_->LookupWithFallback(var, eval, this);
 }
 
@@ -390,12 +411,13 @@ bool ImplicitDepLoader::LoadDepFile(Edge* edge, const string& path,
                         &depfile.out_.len_, &unused, err))
     return false;
 
-  // Check that this depfile matches the edge's output.
+  // Check that this depfile matches the edge's output, if not return false to
+  // mark the edge as dirty.
   Node* first_output = edge->outputs_[0];
   StringPiece opath = StringPiece(first_output->path());
   if (opath != depfile.out_) {
-    *err = "expected depfile '" + path + "' to mention '" +
-        first_output->path() + "', got '" + depfile.out_.AsString() + "'";
+    EXPLAIN("expected depfile '%s' to mention '%s', got '%s'", path.c_str(),
+            first_output->path().c_str(), depfile.out_.AsString().c_str());
     return false;
   }
 

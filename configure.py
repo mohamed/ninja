@@ -291,7 +291,6 @@ if platform.is_msvc():
               # We never have strings or arrays larger than 2**31.
               '/wd4267',
               '/DNOMINMAX', '/D_CRT_SECURE_NO_WARNINGS',
-              '/D_VARIADIC_MAX=10',
               '/DNINJA_PYTHON="%s"' % options.with_python]
     if options.bootstrap:
         # In bootstrap mode, we have no ninja process to catch /showIncludes
@@ -317,8 +316,14 @@ else:
         cflags.remove('-fno-rtti')  # Needed for above pedanticness.
     else:
         cflags += ['-O2', '-DNDEBUG']
-    if 'clang' in os.path.basename(CXX):
-        cflags += ['-fcolor-diagnostics']
+    try:
+        proc = subprocess.Popen(
+            [CXX, '-fdiagnostics-color', '-c', '-x', 'c++', '/dev/null'],
+            stdout=open(os.devnull, 'wb'), stderr=subprocess.STDOUT)
+        if proc.wait() == 0:
+            cflags += ['-fdiagnostics-color']
+    except:
+        pass
     if platform.is_mingw():
         cflags += ['-D_WIN32_WINNT=0x0501']
     ldflags = ['-L$builddir']

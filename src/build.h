@@ -61,14 +61,16 @@ struct Plan {
   void EdgeFinished(Edge* edge);
 
   /// Clean the given node during the build.
-  void CleanNode(DependencyScan* scan, Node* node);
+  /// Return false on error.
+  bool CleanNode(DependencyScan* scan, Node* node, string* err);
 
   /// Number of edges with commands to run.
   int command_edge_count() const { return command_edges_; }
 
 private:
   bool AddSubTarget(Node* node, vector<Node*>* stack, string* err);
-  bool CheckDependencyCycle(Node* node, vector<Node*>* stack, string* err);
+  bool CheckDependencyCycle(Node* node, const vector<Node*>& stack,
+                            string* err);
   void NodeFinished(Node* node);
 
   /// Submits a ready edge as a candidate for execution.

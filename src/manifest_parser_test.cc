@@ -28,6 +28,7 @@ struct ParserTest : public testing::Test,
     string err;
     EXPECT_TRUE(parser.ParseTest(input, &err));
     ASSERT_EQ("", err);
+    VerifyGraph(state);
   }
 
   virtual bool ReadFile(const string& path, string* content, string* err) {
@@ -339,6 +340,42 @@ TEST_F(ParserTest, CanonicalizePathsBackslashes) {
   EXPECT_EQ(1, node->slash_bits());
 }
 #endif
+
+TEST_F(ParserTest, DuplicateEdgeWithMultipleOutputs) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(
+"rule cat\n"
+"  command = cat $in > $out\n"
+"build out1 out2: cat in1\n"
+"build out1: cat in2\n"
+"build final: cat out1\n"
+));
+  // AssertParse() checks that the generated build graph is self-consistent.
+  // That's all the checking that this test needs.
+}
+
+TEST_F(ParserTest, NoDeadPointerFromDuplicateEdge) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(
+"rule cat\n"
+"  command = cat $in > $out\n"
+"build out: cat in\n"
+"build out: cat in\n"
+));
+  // AssertParse() checks that the generated build graph is self-consistent.
+  // That's all the checking that this test needs.
+}
+
+TEST_F(ParserTest, DuplicateEdgeWithMultipleOutputsError) {
+  const char kInput[] =
+"rule cat\n"
+"  command = cat $in > $out\n"
+"build out1 out2: cat in1\n"
+"build out1: cat in2\n"
+"build final: cat out1\n";
+  ManifestParser parser(&state, this, /*dupe_edges_should_err=*/true);
+  string err;
+  EXPECT_FALSE(parser.ParseTest(kInput, &err));
+  EXPECT_EQ("input:5: multiple rules generate out1 [-w dupbuild=err]\n", err);
+}
 
 TEST_F(ParserTest, ReservedWords) {
   ASSERT_NO_FATAL_FAILURE(AssertParse(

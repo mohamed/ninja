@@ -24,8 +24,10 @@
 #include "util.h"
 #include "version.h"
 
-ManifestParser::ManifestParser(State* state, FileReader* file_reader)
-  : state_(state), file_reader_(file_reader) {
+ManifestParser::ManifestParser(State* state, FileReader* file_reader,
+                               bool dupe_edge_should_err)
+    : state_(state), file_reader_(file_reader),
+      dupe_edge_should_err_(dupe_edge_should_err), quiet_(false) {
   env_ = &state->bindings_;
 }
 
@@ -321,6 +323,35 @@ bool ManifestParser::ParseEdge(string* err) {
     edge->pool_ = pool;
   }
 
+  edge->outputs_.reserve(outs.size());
+  for (vector<EvalString>::iterator i = outs.begin(); i != outs.end(); ++i) {
+    string path = i->Evaluate(env);
+    string path_err;
+    unsigned int slash_bits;
+    if (!CanonicalizePath(&path, &slash_bits, &path_err))
+      return lexer_.Error(path_err, err);
+    if (!state_->AddOut(edge, path, slash_bits)) {
+      if (dupe_edge_should_err_) {
+        lexer_.Error("multiple rules generate " + path + " [-w dupbuild=err]",
+                     err);
+        return false;
+      } else if (!quiet_) {
+        Warning("multiple rules generate %s. "
+                "builds involving this target will not be correct; "
+                "continuing anyway [-w dupbuild=warn]",
+                path.c_str());
+      }
+    }
+  }
+  if (edge->outputs_.empty()) {
+    // All outputs of the edge are already created by other edges. Don't add
+    // this edge.  Do this check before input nodes are connected to the edge.
+    state_->edges_.pop_back();
+    delete edge;
+    return true;
+  }
+
+  edge->inputs_.reserve(ins.size());
   for (vector<EvalString>::iterator i = ins.begin(); i != ins.end(); ++i) {
     string path = i->Evaluate(env);
     string path_err;
@@ -328,14 +359,6 @@ bool ManifestParser::ParseEdge(string* err) {
     if (!CanonicalizePath(&path, &slash_bits, &path_err))
       return lexer_.Error(path_err, err);
     state_->AddIn(edge, path, slash_bits);
-  }
-  for (vector<EvalString>::iterator i = outs.begin(); i != outs.end(); ++i) {
-    string path = i->Evaluate(env);
-    string path_err;
-    unsigned int slash_bits;
-    if (!CanonicalizePath(&path, &slash_bits, &path_err))
-      return lexer_.Error(path_err, err);
-    state_->AddOut(edge, path, slash_bits);
   }
   edge->implicit_deps_ = implicit;
   edge->order_only_deps_ = order_only;
