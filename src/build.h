@@ -56,9 +56,13 @@ struct Plan {
   /// Dumps the current state of the plan.
   void Dump();
 
-  /// Mark an edge as done building.  Used internally and by
-  /// tests.
-  void EdgeFinished(Edge* edge);
+  enum EdgeResult {
+    kEdgeFailed,
+    kEdgeSucceeded
+  };
+
+  /// Mark an edge as done building (whether it succeeded or failed).
+  void EdgeFinished(Edge* edge, EdgeResult result);
 
   /// Clean the given node during the build.
   /// Return false on error.
@@ -77,11 +81,6 @@ private:
   /// The edge may be delayed from running, for example if it's a member of a
   /// currently-full pool.
   void ScheduleWork(Edge* edge);
-
-  /// Allows jobs blocking on |edge| to potentially resume.
-  /// For example, if |edge| is a member of a pool, calling this may schedule
-  /// previously pending jobs in that pool.
-  void ResumeDelayedJobs(Edge* edge);
 
   /// Keep track of which edges we want to build in this plan.  If this map does
   /// not contain an entry for an edge, we do not want to build the entry or its
@@ -201,16 +200,24 @@ struct BuildStatus {
   void BuildEdgeStarted(Edge* edge);
   void BuildEdgeFinished(Edge* edge, bool success, const string& output,
                          int* start_time, int* end_time);
+  void BuildStarted();
   void BuildFinished();
+
+  enum EdgeStatus {
+    kEdgeStarted,
+    kEdgeFinished,
+  };
 
   /// Format the progress status string by replacing the placeholders.
   /// See the user manual for more information about the available
   /// placeholders.
   /// @param progress_status_format The format of the progress status.
-  string FormatProgressStatus(const char* progress_status_format) const;
+  /// @param finished True if the edge being printed just finished
+  string FormatProgressStatus(const char* progress_status_format,
+                              EdgeStatus kEdgeFinished) const;
 
  private:
-  void PrintStatus(Edge* edge);
+  void PrintStatus(Edge* edge, EdgeStatus status);
 
   const BuildConfig& config_;
 

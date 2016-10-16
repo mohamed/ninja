@@ -22,22 +22,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <spawn.h>
+
+#ifdef __FreeBSD__
+#  include <sys/param.h>
+#  if defined USE_PPOLL && __FreeBSD_version < 1002000
+#    undef USE_PPOLL
+#  endif
+#endif
+
+extern char** environ;
 
 #include "util.h"
-
-namespace {
-
-bool HasPendingInterruption() {
-  sigset_t pending;
-  sigemptyset(&pending);
-  if (sigpending(&pending) == -1) {
-    perror("ninja: sigpending");
-    return false;
-  }
-  return sigismember(&pending, SIGINT);
-}
-
-}  // anonymous namespace
 
 Subprocess::Subprocess(bool use_console) : fd_(-1), pid_(-1),
                                            use_console_(use_console) {
@@ -64,60 +60,59 @@ bool Subprocess::Start(SubprocessSet* set, const string& command) {
 #endif  // !USE_PPOLL
   SetCloseOnExec(fd_);
 
-  pid_ = fork();
-  if (pid_ < 0)
-    Fatal("fork: %s", strerror(errno));
+  posix_spawn_file_actions_t action;
+  if (posix_spawn_file_actions_init(&action) != 0)
+    Fatal("posix_spawn_file_actions_init: %s", strerror(errno));
 
-  if (pid_ == 0) {
-    close(output_pipe[0]);
+  if (posix_spawn_file_actions_addclose(&action, output_pipe[0]) != 0)
+    Fatal("posix_spawn_file_actions_addclose: %s", strerror(errno));
 
-    // Track which fd we use to report errors on.
-    int error_pipe = output_pipe[1];
-    do {
-      if (sigaction(SIGINT, &set->old_act_, 0) < 0)
-        break;
-      if (sigprocmask(SIG_SETMASK, &set->old_mask_, 0) < 0)
-        break;
+  posix_spawnattr_t attr;
+  if (posix_spawnattr_init(&attr) != 0)
+    Fatal("posix_spawnattr_init: %s", strerror(errno));
 
-      if (!use_console_) {
-        // Put the child in its own session and process group. It will be
-        // detached from the current terminal and ctrl-c won't reach it.
-        // Since this process was just forked, it is not a process group leader
-        // and setsid() will succeed.
-        if (setsid() < 0)
-          break;
+  short flags = 0;
 
-        // Open /dev/null over stdin.
-        int devnull = open("/dev/null", O_RDONLY);
-        if (devnull < 0)
-          break;
-        if (dup2(devnull, 0) < 0)
-          break;
-        close(devnull);
+  flags |= POSIX_SPAWN_SETSIGMASK;
+  if (posix_spawnattr_setsigmask(&attr, &set->old_mask_) != 0)
+    Fatal("posix_spawnattr_setsigmask: %s", strerror(errno));
+  // Signals which are set to be caught in the calling process image are set to
+  // default action in the new process image, so no explicit
+  // POSIX_SPAWN_SETSIGDEF parameter is needed.
 
-        if (dup2(output_pipe[1], 1) < 0 ||
-            dup2(output_pipe[1], 2) < 0)
-          break;
+  // TODO: Consider using POSIX_SPAWN_USEVFORK on Linux with glibc?
 
-        // Now can use stderr for errors.
-        error_pipe = 2;
-        close(output_pipe[1]);
-      }
-      // In the console case, output_pipe is still inherited by the child and
-      // closed when the subprocess finishes, which then notifies ninja.
+  if (!use_console_) {
+    // Put the child in its own process group, so ctrl-c won't reach it.
+    flags |= POSIX_SPAWN_SETPGROUP;
+    // No need to posix_spawnattr_setpgroup(&attr, 0), it's the default.
 
-      execl("/bin/sh", "/bin/sh", "-c", command.c_str(), (char *) NULL);
-    } while (false);
-
-    // If we get here, something went wrong; the execl should have
-    // replaced us.
-    char* err = strerror(errno);
-    if (write(error_pipe, err, strlen(err)) < 0) {
-      // If the write fails, there's nothing we can do.
-      // But this block seems necessary to silence the warning.
+    // Open /dev/null over stdin.
+    if (posix_spawn_file_actions_addopen(&action, 0, "/dev/null", O_RDONLY,
+                                         0) != 0) {
+      Fatal("posix_spawn_file_actions_addopen: %s", strerror(errno));
     }
-    _exit(1);
+
+    if (posix_spawn_file_actions_adddup2(&action, output_pipe[1], 1) != 0)
+      Fatal("posix_spawn_file_actions_adddup2: %s", strerror(errno));
+    if (posix_spawn_file_actions_adddup2(&action, output_pipe[1], 2) != 0)
+      Fatal("posix_spawn_file_actions_adddup2: %s", strerror(errno));
+    // In the console case, output_pipe is still inherited by the child and
+    // closed when the subprocess finishes, which then notifies ninja.
   }
+
+  if (posix_spawnattr_setflags(&attr, flags) != 0)
+    Fatal("posix_spawnattr_setflags: %s", strerror(errno));
+
+  const char* spawned_args[] = { "/bin/sh", "-c", command.c_str(), NULL };
+  if (posix_spawn(&pid_, "/bin/sh", &action, &attr,
+                  const_cast<char**>(spawned_args), environ) != 0)
+    Fatal("posix_spawn: %s", strerror(errno));
+
+  if (posix_spawnattr_destroy(&attr) != 0)
+    Fatal("posix_spawnattr_destroy: %s", strerror(errno));
+  if (posix_spawn_file_actions_destroy(&action) != 0)
+    Fatal("posix_spawn_file_actions_destroy: %s", strerror(errno));
 
   close(output_pipe[1]);
   return true;
@@ -148,7 +143,8 @@ ExitStatus Subprocess::Finish() {
     if (exit == 0)
       return ExitSuccess;
   } else if (WIFSIGNALED(status)) {
-    if (WTERMSIG(status) == SIGINT)
+    if (WTERMSIG(status) == SIGINT || WTERMSIG(status) == SIGTERM
+        || WTERMSIG(status) == SIGHUP)
       return ExitInterrupted;
   }
   return ExitFailure;
@@ -162,31 +158,55 @@ const string& Subprocess::GetOutput() const {
   return buf_;
 }
 
-bool SubprocessSet::interrupted_;
+int SubprocessSet::interrupted_;
 
 void SubprocessSet::SetInterruptedFlag(int signum) {
-  (void) signum;
-  interrupted_ = true;
+  interrupted_ = signum;
+}
+
+void SubprocessSet::HandlePendingInterruption() {
+  sigset_t pending;
+  sigemptyset(&pending);
+  if (sigpending(&pending) == -1) {
+    perror("ninja: sigpending");
+    return;
+  }
+  if (sigismember(&pending, SIGINT))
+    interrupted_ = SIGINT;
+  else if (sigismember(&pending, SIGTERM))
+    interrupted_ = SIGTERM;
+  else if (sigismember(&pending, SIGHUP))
+    interrupted_ = SIGHUP;
 }
 
 SubprocessSet::SubprocessSet() {
   sigset_t set;
   sigemptyset(&set);
   sigaddset(&set, SIGINT);
+  sigaddset(&set, SIGTERM);
+  sigaddset(&set, SIGHUP);
   if (sigprocmask(SIG_BLOCK, &set, &old_mask_) < 0)
     Fatal("sigprocmask: %s", strerror(errno));
 
   struct sigaction act;
   memset(&act, 0, sizeof(act));
   act.sa_handler = SetInterruptedFlag;
-  if (sigaction(SIGINT, &act, &old_act_) < 0)
+  if (sigaction(SIGINT, &act, &old_int_act_) < 0)
+    Fatal("sigaction: %s", strerror(errno));
+  if (sigaction(SIGTERM, &act, &old_term_act_) < 0)
+    Fatal("sigaction: %s", strerror(errno));
+  if (sigaction(SIGHUP, &act, &old_hup_act_) < 0)
     Fatal("sigaction: %s", strerror(errno));
 }
 
 SubprocessSet::~SubprocessSet() {
   Clear();
 
-  if (sigaction(SIGINT, &old_act_, 0) < 0)
+  if (sigaction(SIGINT, &old_int_act_, 0) < 0)
+    Fatal("sigaction: %s", strerror(errno));
+  if (sigaction(SIGTERM, &old_term_act_, 0) < 0)
+    Fatal("sigaction: %s", strerror(errno));
+  if (sigaction(SIGHUP, &old_hup_act_, 0) < 0)
     Fatal("sigaction: %s", strerror(errno));
   if (sigprocmask(SIG_SETMASK, &old_mask_, 0) < 0)
     Fatal("sigprocmask: %s", strerror(errno));
@@ -217,17 +237,18 @@ bool SubprocessSet::DoWork() {
     ++nfds;
   }
 
-  interrupted_ = false;
+  interrupted_ = 0;
   int ret = ppoll(&fds.front(), nfds, NULL, &old_mask_);
   if (ret == -1) {
     if (errno != EINTR) {
       perror("ninja: ppoll");
       return false;
     }
-    return interrupted_;
+    return IsInterrupted();
   }
 
-  if (HasPendingInterruption())
+  HandlePendingInterruption();
+  if (IsInterrupted())
     return true;
 
   nfds_t cur_nfd = 0;
@@ -248,7 +269,7 @@ bool SubprocessSet::DoWork() {
     ++i;
   }
 
-  return interrupted_;
+  return IsInterrupted();
 }
 
 #else  // !defined(USE_PPOLL)
@@ -267,17 +288,18 @@ bool SubprocessSet::DoWork() {
     }
   }
 
-  interrupted_ = false;
+  interrupted_ = 0;
   int ret = pselect(nfds, &set, 0, 0, 0, &old_mask_);
   if (ret == -1) {
     if (errno != EINTR) {
       perror("ninja: pselect");
       return false;
     }
-    return interrupted_;
+    return IsInterrupted();
   }
 
-  if (HasPendingInterruption())
+  HandlePendingInterruption();
+  if (IsInterrupted())
     return true;
 
   for (vector<Subprocess*>::iterator i = running_.begin();
@@ -294,7 +316,7 @@ bool SubprocessSet::DoWork() {
     ++i;
   }
 
-  return interrupted_;
+  return IsInterrupted();
 }
 #endif  // !defined(USE_PPOLL)
 
@@ -309,10 +331,10 @@ Subprocess* SubprocessSet::NextFinished() {
 void SubprocessSet::Clear() {
   for (vector<Subprocess*>::iterator i = running_.begin();
        i != running_.end(); ++i)
-    // Since the foreground process is in our process group, it will receive a
-    // SIGINT at the same time as us.
+    // Since the foreground process is in our process group, it will receive
+    // the interruption signal (i.e. SIGINT or SIGTERM) at the same time as us.
     if (!(*i)->use_console_)
-      kill(-(*i)->pid_, SIGINT);
+      kill(-(*i)->pid_, interrupted_);
   for (vector<Subprocess*>::iterator i = running_.begin();
        i != running_.end(); ++i)
     delete *i;

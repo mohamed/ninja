@@ -44,6 +44,7 @@ struct Pool {
   bool is_valid() const { return depth_ >= 0; }
   int depth() const { return depth_; }
   const string& name() const { return name_; }
+  int current_use() const { return current_use_; }
 
   /// true if the Pool might delay this edge
   bool ShouldDelayEdge() const { return depth_ != 0; }
@@ -109,8 +110,8 @@ struct State {
 
   /// @return the root node(s) of the graph. (Root nodes have no output edges).
   /// @param error where to write the error message if somethings went wrong.
-  vector<Node*> RootNodes(string* error);
-  vector<Node*> DefaultNodes(string* error);
+  vector<Node*> RootNodes(string* error) const;
+  vector<Node*> DefaultNodes(string* error) const;
 
   /// Mapping of path -> Node.
   typedef ExternalStringHashMap<Node*>::Type Paths;
