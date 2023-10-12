@@ -17,11 +17,14 @@
 #ifdef _WIN32
 #include <io.h>
 #include <windows.h>
+#include <direct.h>
 #endif
 
 #include "disk_interface.h"
 #include "graph.h"
 #include "test.h"
+
+using namespace std;
 
 namespace {
 
@@ -63,6 +66,17 @@ TEST_F(DiskInterfaceTest, StatMissingFile) {
   EXPECT_EQ("", err);
 }
 
+TEST_F(DiskInterfaceTest, StatMissingFileWithCache) {
+  disk_.AllowStatCache(true);
+  string err;
+
+  // On Windows, the errno for FindFirstFileExA, which is used when the stat
+  // cache is enabled, is different when the directory name is not a directory.
+  ASSERT_TRUE(Touch("notadir"));
+  EXPECT_EQ(0, disk_.Stat("notadir/nosuchfile", &err));
+  EXPECT_EQ("", err);
+}
+
 TEST_F(DiskInterfaceTest, StatBadPath) {
   string err;
 #ifdef _WIN32
@@ -83,10 +97,30 @@ TEST_F(DiskInterfaceTest, StatExistingFile) {
   EXPECT_EQ("", err);
 }
 
+#ifdef _WIN32
+TEST_F(DiskInterfaceTest, StatExistingFileWithLongPath) {
+  string err;
+  char currentdir[32767];
+  _getcwd(currentdir, sizeof(currentdir));
+  const string filename = string(currentdir) +
+"\\filename_with_256_characters_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxx";
+  const string prefixed = "\\\\?\\" + filename;
+  ASSERT_TRUE(Touch(prefixed.c_str()));
+  EXPECT_GT(disk_.Stat(disk_.AreLongPathsEnabled() ?
+    filename : prefixed, &err), 1);
+  EXPECT_EQ("", err);
+}
+#endif
+
 TEST_F(DiskInterfaceTest, StatExistingDir) {
   string err;
   ASSERT_TRUE(disk_.MakeDir("subdir"));
   ASSERT_TRUE(disk_.MakeDir("subdir/subsubdir"));
+  EXPECT_GT(disk_.Stat("..", &err), 1);
+  EXPECT_EQ("", err);
   EXPECT_GT(disk_.Stat(".", &err), 1);
   EXPECT_EQ("", err);
   EXPECT_GT(disk_.Stat("subdir", &err), 1);
@@ -105,7 +139,6 @@ TEST_F(DiskInterfaceTest, StatExistingDir) {
 #ifdef _WIN32
 TEST_F(DiskInterfaceTest, StatCache) {
   string err;
-  disk_.AllowStatCache(true);
 
   ASSERT_TRUE(Touch("file1"));
   ASSERT_TRUE(Touch("fiLE2"));
@@ -114,6 +147,10 @@ TEST_F(DiskInterfaceTest, StatCache) {
   ASSERT_TRUE(Touch("subdir\\subfile1"));
   ASSERT_TRUE(Touch("subdir\\SUBFILE2"));
   ASSERT_TRUE(Touch("subdir\\SUBFILE3"));
+
+  disk_.AllowStatCache(false);
+  TimeStamp parent_stat_uncached = disk_.Stat("..", &err);
+  disk_.AllowStatCache(true);
 
   EXPECT_GT(disk_.Stat("FIle1", &err), 1);
   EXPECT_EQ("", err);
@@ -125,6 +162,8 @@ TEST_F(DiskInterfaceTest, StatCache) {
   EXPECT_GT(disk_.Stat("sUbdir\\suBFile1", &err), 1);
   EXPECT_EQ("", err);
 
+  EXPECT_GT(disk_.Stat("..", &err), 1);
+  EXPECT_EQ("", err);
   EXPECT_GT(disk_.Stat(".", &err), 1);
   EXPECT_EQ("", err);
   EXPECT_GT(disk_.Stat("subdir", &err), 1);
@@ -132,11 +171,15 @@ TEST_F(DiskInterfaceTest, StatCache) {
   EXPECT_GT(disk_.Stat("subdir/subsubdir", &err), 1);
   EXPECT_EQ("", err);
 
+#ifndef _MSC_VER // TODO: Investigate why. Also see https://github.com/ninja-build/ninja/pull/1423
   EXPECT_EQ(disk_.Stat("subdir", &err),
             disk_.Stat("subdir/.", &err));
   EXPECT_EQ("", err);
   EXPECT_EQ(disk_.Stat("subdir", &err),
             disk_.Stat("subdir/subsubdir/..", &err));
+#endif
+  EXPECT_EQ("", err);
+  EXPECT_EQ(disk_.Stat("..", &err), parent_stat_uncached);
   EXPECT_EQ("", err);
   EXPECT_EQ(disk_.Stat("subdir/subsubdir", &err),
             disk_.Stat("subdir/subsubdir/.", &err));
@@ -179,13 +222,13 @@ TEST_F(DiskInterfaceTest, ReadFile) {
 
 TEST_F(DiskInterfaceTest, MakeDirs) {
   string path = "path/with/double//slash/";
-  EXPECT_TRUE(disk_.MakeDirs(path.c_str()));
+  EXPECT_TRUE(disk_.MakeDirs(path));
   FILE* f = fopen((path + "a_file").c_str(), "w");
   EXPECT_TRUE(f);
   EXPECT_EQ(0, fclose(f));
 #ifdef _WIN32
   string path2 = "another\\with\\back\\\\slashes\\";
-  EXPECT_TRUE(disk_.MakeDirs(path2.c_str()));
+  EXPECT_TRUE(disk_.MakeDirs(path2));
   FILE* f2 = fopen((path2 + "a_file").c_str(), "w");
   EXPECT_TRUE(f2);
   EXPECT_EQ(0, fclose(f2));
@@ -198,11 +241,25 @@ TEST_F(DiskInterfaceTest, RemoveFile) {
   EXPECT_EQ(0, disk_.RemoveFile(kFileName));
   EXPECT_EQ(1, disk_.RemoveFile(kFileName));
   EXPECT_EQ(1, disk_.RemoveFile("does not exist"));
+#ifdef _WIN32
+  ASSERT_TRUE(Touch(kFileName));
+  EXPECT_EQ(0, system((std::string("attrib +R ") + kFileName).c_str()));
+  EXPECT_EQ(0, disk_.RemoveFile(kFileName));
+  EXPECT_EQ(1, disk_.RemoveFile(kFileName));
+#endif
+}
+
+TEST_F(DiskInterfaceTest, RemoveDirectory) {
+  const char* kDirectoryName = "directory-to-remove";
+  EXPECT_TRUE(disk_.MakeDir(kDirectoryName));
+  EXPECT_EQ(0, disk_.RemoveFile(kDirectoryName));
+  EXPECT_EQ(1, disk_.RemoveFile(kDirectoryName));
+  EXPECT_EQ(1, disk_.RemoveFile("does not exist"));
 }
 
 struct StatTest : public StateTestWithBuiltinRules,
                   public DiskInterface {
-  StatTest() : scan_(&state_, NULL, NULL, this) {}
+  StatTest() : scan_(&state_, NULL, NULL, this, NULL) {}
 
   // DiskInterface implementation.
   virtual TimeStamp Stat(const string& path, string* err) const;
@@ -245,7 +302,7 @@ TEST_F(StatTest, Simple) {
   EXPECT_TRUE(out->Stat(this, &err));
   EXPECT_EQ("", err);
   ASSERT_EQ(1u, stats_.size());
-  scan_.RecomputeDirty(out->in_edge(), NULL);
+  scan_.RecomputeDirty(out, NULL, NULL);
   ASSERT_EQ(2u, stats_.size());
   ASSERT_EQ("out", stats_[0]);
   ASSERT_EQ("in",  stats_[1]);
@@ -261,7 +318,7 @@ TEST_F(StatTest, TwoStep) {
   EXPECT_TRUE(out->Stat(this, &err));
   EXPECT_EQ("", err);
   ASSERT_EQ(1u, stats_.size());
-  scan_.RecomputeDirty(out->in_edge(), NULL);
+  scan_.RecomputeDirty(out, NULL, NULL);
   ASSERT_EQ(3u, stats_.size());
   ASSERT_EQ("out", stats_[0]);
   ASSERT_TRUE(GetNode("out")->dirty());
@@ -281,7 +338,7 @@ TEST_F(StatTest, Tree) {
   EXPECT_TRUE(out->Stat(this, &err));
   EXPECT_EQ("", err);
   ASSERT_EQ(1u, stats_.size());
-  scan_.RecomputeDirty(out->in_edge(), NULL);
+  scan_.RecomputeDirty(out, NULL, NULL);
   ASSERT_EQ(1u + 6u, stats_.size());
   ASSERT_EQ("mid1", stats_[1]);
   ASSERT_TRUE(GetNode("mid1")->dirty());
@@ -302,7 +359,7 @@ TEST_F(StatTest, Middle) {
   EXPECT_TRUE(out->Stat(this, &err));
   EXPECT_EQ("", err);
   ASSERT_EQ(1u, stats_.size());
-  scan_.RecomputeDirty(out->in_edge(), NULL);
+  scan_.RecomputeDirty(out, NULL, NULL);
   ASSERT_FALSE(GetNode("in")->dirty());
   ASSERT_TRUE(GetNode("mid")->dirty());
   ASSERT_TRUE(GetNode("out")->dirty());

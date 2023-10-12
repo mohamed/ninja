@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2001 Google Inc. All Rights Reserved.
 #
@@ -18,8 +18,6 @@
 
 Projects that use ninja themselves should either write a similar script
 or use a meta-build system that supports Ninja output."""
-
-from __future__ import print_function
 
 from optparse import OptionParser
 import os
@@ -60,11 +58,16 @@ class Platform(object):
             self._platform = 'netbsd'
         elif self._platform.startswith('aix'):
             self._platform = 'aix'
+        elif self._platform.startswith('os400'):
+            self._platform = 'os400'
+        elif self._platform.startswith('dragonfly'):
+            self._platform = 'dragonfly'
 
     @staticmethod
     def known_platforms():
       return ['linux', 'darwin', 'freebsd', 'openbsd', 'solaris', 'sunos5',
-              'mingw', 'msvc', 'gnukfreebsd', 'bitrig', 'netbsd', 'aix']
+              'mingw', 'msvc', 'gnukfreebsd', 'bitrig', 'netbsd', 'aix',
+              'dragonfly']
 
     def platform(self):
         return self._platform
@@ -79,7 +82,7 @@ class Platform(object):
         return self._platform == 'msvc'
 
     def msvc_needs_fs(self):
-        popen = subprocess.Popen(['cl', '/nologo', '/?'],
+        popen = subprocess.Popen(['cl', '/nologo', '/help'],
                                  stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE)
         out, err = popen.communicate()
@@ -94,11 +97,15 @@ class Platform(object):
     def is_aix(self):
         return self._platform == 'aix'
 
+    def is_os400_pase(self):
+        return self._platform == 'os400' or os.uname().sysname.startswith('OS400')
+
     def uses_usr_local(self):
-        return self._platform in ('freebsd', 'openbsd', 'bitrig')
+        return self._platform in ('freebsd', 'openbsd', 'bitrig', 'dragonfly', 'netbsd')
 
     def supports_ppoll(self):
-        return self._platform in ('freebsd', 'linux', 'openbsd', 'bitrig')
+        return self._platform in ('freebsd', 'linux', 'openbsd', 'bitrig',
+                                  'dragonfly')
 
     def supports_ninja_browse(self):
         return (not self.is_windows()
@@ -252,7 +259,7 @@ configure_args = sys.argv[1:]
 if '--bootstrap' in configure_args:
     configure_args.remove('--bootstrap')
 n.variable('configure_args', ' '.join(configure_args))
-env_keys = set(['CXX', 'AR', 'CFLAGS', 'LDFLAGS'])
+env_keys = set(['CXX', 'AR', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS'])
 configure_env = dict((k, os.environ[k]) for k in os.environ if k in env_keys)
 if configure_env:
     config_str = ' '.join([k + '=' + pipes.quote(configure_env[k])
@@ -260,7 +267,7 @@ if configure_env:
     n.variable('configure_env', config_str + '$ ')
 n.newline()
 
-CXX = configure_env.get('CXX', 'g++')
+CXX = configure_env.get('CXX', 'c++')
 objext = '.o'
 if platform.is_msvc():
     CXX = 'cl'
@@ -296,13 +303,24 @@ if platform.is_msvc():
 else:
     n.variable('ar', configure_env.get('AR', 'ar'))
 
+def search_system_path(file_name):
+  """Find a file in the system path."""
+  for dir in os.environ['path'].split(';'):
+    path = os.path.join(dir, file_name)
+    if os.path.exists(path):
+      return path
+
+# Note that build settings are separately specified in CMakeLists.txt and
+# these lists should be kept in sync.
 if platform.is_msvc():
+    if not search_system_path('cl.exe'):
+        raise Exception('cl.exe not found. Run again from the Developer Command Prompt for VS')
     cflags = ['/showIncludes',
               '/nologo',  # Don't print startup banner.
               '/Zi',  # Create pdb with debug info.
               '/W4',  # Highest warning level.
               '/WX',  # Warnings as errors.
-              '/wd4530', '/wd4100', '/wd4706',
+              '/wd4530', '/wd4100', '/wd4706', '/wd4244',
               '/wd4512', '/wd4800', '/wd4702', '/wd4819',
               # Disable warnings about constant conditional expressions.
               '/wd4127',
@@ -311,6 +329,7 @@ if platform.is_msvc():
               # Disable warnings about ignored typedef in DbgHelp.h
               '/wd4091',
               '/GR-',  # Disable RTTI.
+              '/Zc:__cplusplus',
               # Disable size_t -> int truncation warning.
               # We never have strings or arrays larger than 2**31.
               '/wd4267',
@@ -330,6 +349,7 @@ else:
               '-Wno-unused-parameter',
               '-fno-rtti',
               '-fno-exceptions',
+              '-std=c++11',
               '-fvisibility=hidden', '-pipe',
               '-DNINJA_PYTHON="%s"' % options.with_python]
     if options.debug:
@@ -347,11 +367,16 @@ else:
     except:
         pass
     if platform.is_mingw():
-        cflags += ['-D_WIN32_WINNT=0x0501']
+        cflags += ['-D_WIN32_WINNT=0x0601', '-D__USE_MINGW_ANSI_STDIO=1']
     ldflags = ['-L$builddir']
     if platform.uses_usr_local():
         cflags.append('-I/usr/local/include')
         ldflags.append('-L/usr/local/lib')
+    if platform.is_aix():
+        # printf formats for int64_t, uint64_t; large file support
+        cflags.append('-D__STDC_FORMAT_MACROS')
+        cflags.append('-D_LARGE_FILES')
+
 
 libs = []
 
@@ -393,6 +418,10 @@ def shell_escape(str):
 
 if 'CFLAGS' in configure_env:
     cflags.append(configure_env['CFLAGS'])
+    ldflags.append(configure_env['CFLAGS'])
+if 'CXXFLAGS' in configure_env:
+    cflags.append(configure_env['CXXFLAGS'])
+    ldflags.append(configure_env['CXXFLAGS'])
 n.variable('cflags', ' '.join(shell_escape(flag) for flag in cflags))
 if 'LDFLAGS' in configure_env:
     ldflags.append(configure_env['LDFLAGS'])
@@ -401,7 +430,7 @@ n.newline()
 
 if platform.is_msvc():
     n.rule('cxx',
-        command='$cxx $cflags -c $in /Fo$out',
+        command='$cxx $cflags -c $in /Fo$out /Fd' + built('$pdb'),
         description='CXX $out',
         deps='msvc'  # /showIncludes is included in $cflags.
     )
@@ -419,7 +448,7 @@ if host.is_msvc():
            description='LIB $out')
 elif host.is_mingw():
     n.rule('ar',
-           command='cmd /c $ar cqs $out.tmp $in && move /Y $out.tmp $out',
+           command='$ar crs $out $in',
            description='AR $out')
 else:
     n.rule('ar',
@@ -456,50 +485,70 @@ n.comment('the depfile parser and ninja lexers are generated using re2c.')
 def has_re2c():
     try:
         proc = subprocess.Popen(['re2c', '-V'], stdout=subprocess.PIPE)
-        return int(proc.communicate()[0], 10) >= 1103
+        return int(proc.communicate()[0], 10) >= 1503
     except OSError:
         return False
 if has_re2c():
     n.rule('re2c',
-           command='re2c -b -i --no-generation-date -o $out $in',
+           command='re2c -b -i --no-generation-date --no-version -o $out $in',
            description='RE2C $out')
     # Generate the .cc files in the source directory so we can check them in.
     n.build(src('depfile_parser.cc'), 're2c', src('depfile_parser.in.cc'))
     n.build(src('lexer.cc'), 're2c', src('lexer.in.cc'))
 else:
-    print("warning: A compatible version of re2c (>= 0.11.3) was not found; "
+    print("warning: A compatible version of re2c (>= 0.15.3) was not found; "
            "changes to src/*.in.cc will not affect your build.")
 n.newline()
 
+cxxvariables = []
+if platform.is_msvc():
+    cxxvariables = [('pdb', 'ninja.pdb')]
+
+n.comment('Generate a library for `ninja-re2c`.')
+re2c_objs = []
+for name in ['depfile_parser', 'lexer']:
+    re2c_objs += cxx(name, variables=cxxvariables)
+if platform.is_msvc():
+    n.build(built('ninja-re2c.lib'), 'ar', re2c_objs)
+else:
+    n.build(built('libninja-re2c.a'), 'ar', re2c_objs)
+n.newline()
+
 n.comment('Core source files all build into ninja library.')
+objs.extend(re2c_objs)
 for name in ['build',
              'build_log',
              'clean',
              'clparser',
              'debug_flags',
-             'depfile_parser',
              'deps_log',
              'disk_interface',
+             'dyndep',
+             'dyndep_parser',
              'edit_distance',
              'eval_env',
              'graph',
              'graphviz',
-             'lexer',
+             'json',
              'line_printer',
              'manifest_parser',
              'metrics',
+             'missing_deps',
+             'parser',
              'state',
+             'status',
+             'string_piece_util',
              'util',
              'version']:
-    objs += cxx(name)
+    objs += cxx(name, variables=cxxvariables)
 if platform.is_windows():
     for name in ['subprocess-win32',
                  'includes_normalize-win32',
                  'msvc_helper-win32',
                  'msvc_helper_main-win32']:
-        objs += cxx(name)
+        objs += cxx(name, variables=cxxvariables)
     if platform.is_msvc():
-        objs += cxx('minidump-win32')
+        objs += cxx('minidump-win32', variables=cxxvariables)
     objs += cc('getopt')
 else:
     objs += cxx('subprocess-posix')
@@ -516,13 +565,13 @@ if platform.is_msvc():
 else:
     libs.append('-lninja')
 
-if platform.is_aix():
+if platform.is_aix() and not platform.is_os400_pase():
     libs.append('-lperfstat')
 
 all_targets = []
 
 n.comment('Main executable is library plus main() function.')
-objs = cxx('ninja')
+objs = cxx('ninja', variables=cxxvariables)
 ninja = n.build(binary('ninja'), 'link', objs, implicit=ninja_lib,
                 variables=[('libs', libs)])
 n.newline()
@@ -537,6 +586,8 @@ if options.bootstrap:
 n.comment('Tests all build into ninja_test executable.')
 
 objs = []
+if platform.is_msvc():
+    cxxvariables = [('pdb', 'ninja_test.pdb')]
 
 for name in ['build_log_test',
              'build_test',
@@ -544,20 +595,25 @@ for name in ['build_log_test',
              'clparser_test',
              'depfile_parser_test',
              'deps_log_test',
+             'dyndep_parser_test',
              'disk_interface_test',
              'edit_distance_test',
              'graph_test',
+             'json_test',
              'lexer_test',
              'manifest_parser_test',
+             'missing_deps_test',
              'ninja_test',
              'state_test',
+             'status_test',
+             'string_piece_util_test',
              'subprocess_test',
              'test',
              'util_test']:
-    objs += cxx(name)
+    objs += cxx(name, variables=cxxvariables)
 if platform.is_windows():
     for name in ['includes_normalize_test', 'msvc_helper_test']:
-        objs += cxx(name)
+        objs += cxx(name, variables=cxxvariables)
 
 ninja_test = n.build(binary('ninja_test'), 'link', objs, implicit=ninja_lib,
                      variables=[('libs', libs)])
@@ -566,21 +622,24 @@ all_targets += ninja_test
 
 
 n.comment('Ancillary executables.')
-objs = cxx('build_log_perftest')
-all_targets += n.build(binary('build_log_perftest'), 'link', objs,
-                       implicit=ninja_lib, variables=[('libs', libs)])
-objs = cxx('canon_perftest')
-all_targets += n.build(binary('canon_perftest'), 'link', objs,
-                       implicit=ninja_lib, variables=[('libs', libs)])
-objs = cxx('depfile_parser_perftest')
-all_targets += n.build(binary('depfile_parser_perftest'), 'link', objs,
-                       implicit=ninja_lib, variables=[('libs', libs)])
-objs = cxx('hash_collision_bench')
-all_targets += n.build(binary('hash_collision_bench'), 'link', objs,
-                              implicit=ninja_lib, variables=[('libs', libs)])
-objs = cxx('manifest_parser_perftest')
-all_targets += n.build(binary('manifest_parser_perftest'), 'link', objs,
-                              implicit=ninja_lib, variables=[('libs', libs)])
+
+if platform.is_aix() and '-maix64' not in ldflags:
+    # Both hash_collision_bench and manifest_parser_perftest require more
+    # memory than will fit in the standard 32-bit AIX shared stack/heap (256M)
+    libs.append('-Wl,-bmaxdata:0x80000000')
+
+for name in ['build_log_perftest',
+             'canon_perftest',
+             'depfile_parser_perftest',
+             'hash_collision_bench',
+             'manifest_parser_perftest',
+             'clparser_perftest']:
+  if platform.is_msvc():
+    cxxvariables = [('pdb', name + '.pdb')]
+  objs = cxx(name, variables=cxxvariables)
+  all_targets += n.build(binary(name), 'link', objs,
+                         implicit=ninja_lib, variables=[('libs', libs)])
+
 n.newline()
 
 n.comment('Generate a graph using the "graph" tool.')
@@ -622,7 +681,7 @@ n.rule('doxygen_mainpage',
        command='$doxygen_mainpage_generator $in > $out',
        description='DOXYGEN_MAINPAGE $out')
 mainpage = n.build(built('doxygen_mainpage'), 'doxygen_mainpage',
-                   ['README', 'COPYING'],
+                   ['README.md', 'COPYING'],
                    implicit=['$doxygen_mainpage_generator'])
 n.build('doxygen', 'doxygen', doc('doxygen.config'),
         implicit=mainpage)

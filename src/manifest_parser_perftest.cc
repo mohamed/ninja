@@ -25,6 +25,9 @@
 #ifdef _WIN32
 #include "getopt.h"
 #include <direct.h>
+#elif defined(_AIX)
+#include "getopt.h"
+#include <unistd.h>
 #else
 #include <getopt.h>
 #include <unistd.h>
@@ -36,6 +39,8 @@
 #include "metrics.h"
 #include "state.h"
 #include "util.h"
+
+using namespace std;
 
 bool WriteFakeManifests(const string& dir, string* err) {
   RealDiskInterface disk_interface;
@@ -56,7 +61,7 @@ int LoadManifests(bool measure_command_evaluation) {
   string err;
   RealDiskInterface disk_interface;
   State state;
-  ManifestParser parser(&state, &disk_interface, kDupeEdgeActionWarn);
+  ManifestParser parser(&state, &disk_interface);
   if (!parser.Load("build.ninja", &err)) {
     fprintf(stderr, "Failed to read test data: %s\n", err.c_str());
     exit(1);

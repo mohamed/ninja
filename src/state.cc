@@ -19,9 +19,9 @@
 
 #include "edit_distance.h"
 #include "graph.h"
-#include "metrics.h"
 #include "util.h"
 
+using namespace std;
 
 void Pool::EdgeScheduled(const Edge& edge) {
   if (depth_ != 0)
@@ -38,7 +38,7 @@ void Pool::DelayEdge(Edge* edge) {
   delayed_.insert(edge);
 }
 
-void Pool::RetrieveReadyEdges(set<Edge*>* ready_queue) {
+void Pool::RetrieveReadyEdges(EdgeSet* ready_queue) {
   DelayedEdges::iterator it = delayed_.begin();
   while (it != delayed_.end()) {
     Edge* edge = *it;
@@ -59,14 +59,6 @@ void Pool::Dump() const {
     printf("\t");
     (*it)->Dump();
   }
-}
-
-// static
-bool Pool::WeightedEdgeCmp(const Edge* a, const Edge* b) {
-  if (!a) return b;
-  if (!b) return false;
-  int weight_diff = a->weight() - b->weight();
-  return ((weight_diff < 0) || (weight_diff == 0 && a < b));
 }
 
 Pool State::kDefaultPool("", 0);
@@ -96,11 +88,12 @@ Edge* State::AddEdge(const Rule* rule) {
   edge->rule_ = rule;
   edge->pool_ = &State::kDefaultPool;
   edge->env_ = &bindings_;
+  edge->id_ = edges_.size();
   edges_.push_back(edge);
   return edge;
 }
 
-Node* State::GetNode(StringPiece path, unsigned int slash_bits) {
+Node* State::GetNode(StringPiece path, uint64_t slash_bits) {
   Node* node = LookupNode(path);
   if (node)
     return node;
@@ -110,7 +103,6 @@ Node* State::GetNode(StringPiece path, unsigned int slash_bits) {
 }
 
 Node* State::LookupNode(StringPiece path) const {
-  METRIC_RECORD("lookup node");
   Paths::const_iterator i = paths_.find(path);
   if (i != paths_.end())
     return i->second;
@@ -134,19 +126,25 @@ Node* State::SpellcheckNode(const string& path) {
   return result;
 }
 
-void State::AddIn(Edge* edge, StringPiece path, unsigned int slash_bits) {
+void State::AddIn(Edge* edge, StringPiece path, uint64_t slash_bits) {
   Node* node = GetNode(path, slash_bits);
   edge->inputs_.push_back(node);
   node->AddOutEdge(edge);
 }
 
-bool State::AddOut(Edge* edge, StringPiece path, unsigned int slash_bits) {
+bool State::AddOut(Edge* edge, StringPiece path, uint64_t slash_bits) {
   Node* node = GetNode(path, slash_bits);
   if (node->in_edge())
     return false;
   edge->outputs_.push_back(node);
   node->set_in_edge(edge);
   return true;
+}
+
+void State::AddValidation(Edge* edge, StringPiece path, uint64_t slash_bits) {
+  Node* node = GetNode(path, slash_bits);
+  edge->validations_.push_back(node);
+  node->AddValidationOutEdge(edge);
 }
 
 bool State::AddDefault(StringPiece path, string* err) {
@@ -184,8 +182,11 @@ vector<Node*> State::DefaultNodes(string* err) const {
 void State::Reset() {
   for (Paths::iterator i = paths_.begin(); i != paths_.end(); ++i)
     i->second->ResetState();
-  for (vector<Edge*>::iterator e = edges_.begin(); e != edges_.end(); ++e)
+  for (vector<Edge*>::iterator e = edges_.begin(); e != edges_.end(); ++e) {
     (*e)->outputs_ready_ = false;
+    (*e)->deps_loaded_ = false;
+    (*e)->mark_ = Edge::VisitNone;
+  }
 }
 
 void State::Dump() {
