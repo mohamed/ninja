@@ -62,6 +62,16 @@ TEST_F(DepfileParserTest, Continuation) {
   EXPECT_EQ(2u, parser_.ins_.size());
 }
 
+TEST_F(DepfileParserTest, WindowsDrivePaths) {
+  string err;
+  EXPECT_TRUE(Parse("foo.o: //?/c:/bar.h\n", &err));
+  ASSERT_EQ("", err);
+  ASSERT_EQ(1u, parser_.outs_.size());
+  EXPECT_EQ("foo.o", parser_.outs_[0].AsString());
+  EXPECT_EQ(1u, parser_.ins_.size());
+  EXPECT_EQ("//?/c:/bar.h", parser_.ins_[0].AsString());
+}
+
 TEST_F(DepfileParserTest, CarriageReturnContinuation) {
   string err;
   EXPECT_TRUE(Parse(
@@ -377,4 +387,25 @@ TEST_F(DepfileParserTest, BuggyMP) {
                      "y:\n"
                      "z:\n", &err));
   ASSERT_EQ("inputs may not also have inputs", err);
+}
+
+TEST_F(DepfileParserTest, EmptyFile) {
+  std::string err;
+  EXPECT_TRUE(Parse("", &err));
+  ASSERT_EQ(0u, parser_.outs_.size());
+  ASSERT_EQ(0u, parser_.ins_.size());
+}
+
+TEST_F(DepfileParserTest, EmptyLines) {
+  std::string err;
+  EXPECT_TRUE(Parse("\n\n", &err));
+  ASSERT_EQ(0u, parser_.outs_.size());
+  ASSERT_EQ(0u, parser_.ins_.size());
+}
+
+TEST_F(DepfileParserTest, MissingColon) {
+  // The file is not empty but is missing a colon separator.
+  std::string err;
+  EXPECT_FALSE(Parse("foo.o foo.c\n", &err));
+  EXPECT_EQ("expected ':' in depfile", err);
 }

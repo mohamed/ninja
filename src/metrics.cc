@@ -37,23 +37,19 @@ int64_t HighResTimer() {
       .count();
 }
 
-constexpr int64_t GetFrequency() {
-  // If numerator isn't 1 then we lose precision and that will need to be
-  // assessed.
-  static_assert(std::chrono::steady_clock::period::num == 1,
-                "Numerator must be 1");
-  return std::chrono::steady_clock::period::den /
-         std::chrono::steady_clock::period::num;
-}
-
 int64_t TimerToMicros(int64_t dt) {
   // dt is in ticks.  We want microseconds.
-  return (dt * 1000000) / GetFrequency();
+  return chrono::duration_cast<chrono::microseconds>(
+             std::chrono::steady_clock::duration{ dt })
+      .count();
 }
 
 int64_t TimerToMicros(double dt) {
   // dt is in ticks.  We want microseconds.
-  return (dt * 1000000) / GetFrequency();
+  using DoubleSteadyClock =
+      std::chrono::duration<double, std::chrono::steady_clock::period>;
+  return chrono::duration_cast<chrono::microseconds>(DoubleSteadyClock{ dt })
+      .count();
 }
 
 }  // anonymous namespace
